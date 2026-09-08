@@ -13,6 +13,7 @@ pub(crate) mod fmt;
 mod macros;
 
 pub mod adc;
+mod common;
 pub mod dma;
 pub mod flash;
 pub mod gpio;
@@ -24,6 +25,7 @@ pub mod i2c_target;
 #[cfg(any(mspm0g150x, mspm0g151x, mspm0g350x, mspm0g351x))]
 pub mod mathacl;
 pub mod sysctl;
+
 pub mod tim;
 #[cfg(any(mspm0g150x, mspm0g151x, mspm0g350x, mspm0g351x, mspm0l122x, mspm0l222x))]
 pub mod trng;
@@ -73,6 +75,7 @@ pub use mspm0_metapac as pac;
 pub(crate) use mspm0_metapac as pac;
 
 pub use crate::_generated::interrupt;
+use crate::sysctl::clocks::ClockConfig;
 
 /// Macro to bind interrupts to handlers.
 ///
@@ -150,9 +153,10 @@ macro_rules! bind_interrupts {
 
 /// `embassy-mspm0` global configuration.
 #[non_exhaustive]
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Config {
-    // TODO: OSC configuration.
+    pub clock_config: ClockConfig,
+
     /// The size of DMA block transfer burst.
     ///
     /// If this is set to a value
@@ -169,6 +173,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            clock_config: ClockConfig::default(),
             dma_burst_size: dma::BurstSize::Complete,
             dma_round_robin: false,
         }
@@ -179,21 +184,7 @@ pub fn init(config: Config) -> Peripherals {
     critical_section::with(|cs| {
         let peripherals = Peripherals::take_with_cs(cs);
 
-        // TODO: Further clock configuration
-
-        pac::SYSCTL.mclkcfg().modify(|w| {
-            // Enable MFCLK
-            w.set_usemftick(true);
-            // MDIV must be disabled if MFCLK is enabled.
-            w.set_mdiv(0);
-        });
-
-        // Enable MFCLK for peripheral use
-        //
-        // TODO: Optional?
-        pac::SYSCTL.genclken().modify(|w| {
-            w.set_mfpclken(true);
-        });
+        unsafe { crate::sysctl::clocks::init(config.clock_config) };
 
         pac::SYSCTL.borthreshold().modify(|w| {
             w.set_level(0);
