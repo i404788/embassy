@@ -185,7 +185,7 @@ pub struct Adc<'d, T: Instance, M: Mode> {
     _mode: PhantomData<M>,
 }
 
-impl<'d, T: Instance, M: Mode> Adc<'d, T, M> {
+impl<'d, T: Instance> Adc<'d, T, Blocking> {
     pub fn new_blocking(peri: Peri<'d, T>, config: Config) -> Adc<'d, T, Blocking> {
         Self::setup(config);
         Adc {
@@ -218,7 +218,9 @@ impl<'d, T: Instance, M: Mode> Adc<'d, T, M> {
         while r.ctl0().read().enc() {}
         r.memres(0).read().data()
     }
+}
 
+impl<'d, T: Instance, M: Mode> Adc<'d, T, M> {
     pub fn resolution(&self) -> Resolution {
         let r = T::info().regs;
         let ctl2 = r.ctl2().read();
@@ -307,6 +309,17 @@ impl<'d, T: Instance> Adc<'d, T, Async> {
     /// Read one or multiple ADC regular channels using the irq handler.
     ///
     /// `sequence` iterator and `readings` must have the same length.
+    ///
+    /// The same channel may appear multiple times in the sequence (e.g. for oversampling):
+    ///
+    /// ```ignore
+    /// let sequence = [
+    ///     (pin.borrow_adc(), conversion),
+    ///     (pin.borrow_adc(), conversion),
+    ///     (other_pin.borrow_adc(), conversion),
+    /// ];
+    /// adc.irq_read_sequence(sequence.into_iter(), &mut readings).await;
+    /// ```
     pub async fn irq_read_sequence<'a>(
         &mut self,
         sequence: impl ExactSizeIterator<Item = (BorrowedAdcChannel<'a, T>, Conversion)>,
@@ -354,7 +367,87 @@ impl<'d, T: Instance> Adc<'d, T, Async> {
         }
     }
 
-    // TODO: DMA driven ADC
+    /// Read one or multiple ADC regular channels using DMA.
+    ///
+    /// `sequence` iterator and `readings` must have the same length. The same channel may appear
+    /// multiple times in the sequence (e.g. for oversampling), see [`Self::irq_read_sequence`].
+    ///
+    /// Each conversion result is transferred to `readings` by the DMA channel without CPU
+    /// intervention. The returned future resolves once the complete sequence has been transferred.
+    #[cfg(adc_dma)]
+    pub async fn dma_read_sequence<'a>(
+        &mut self,
+        sequence: impl ExactSizeIterator<Item = (BorrowedAdcChannel<'a, T>, Conversion)>,
+        dma: &mut crate::dma::Channel<'_>,
+        readings: &mut [u16],
+    ) -> Result<(), crate::dma::Error> {
+        use crate::dma::{TransferMode, TransferOptions};
+
+        assert!(sequence.len() != 0, "Read sequence cannot be empty");
+        assert!(
+            sequence.len() == readings.len(),
+            "Sequence length must be equal to readings length"
+        );
+        assert!(
+            sequence.len() <= MAX_SEQUENCE_LEN,
+            "DMA read sequence cannot be more than {} in length",
+            MAX_SEQUENCE_LEN
+        );
+
+        let r = T::info().regs;
+
+        // Wait until ADC is not converting to start.
+        //
+        // This is needed a future which started sampling could have been dropped half way through.
+        Self::wait_for_conversion().await;
+        Self::setup_sequence(sequence.map(|(ch, conv)| (ch.get_hw_channel(), conv)));
+
+        // DMAEN is cleared by hardware when the DMA completes the block transfer (SLAU846
+        // 18.2.12.3), so it must be set again before every read.
+        r.ctl2().modify(|w| {
+            w.set_dmaen(true);
+            // One ADC sample is transferred per DMA trigger (non-FIFO mode).
+            w.set_sampcnt(vals::Sampcnt::from_bits(1));
+        });
+
+        // Unmask the MEMRES result flags as DMA trigger sources and clear any pending flags.
+        r.dma_trig(0).iclr().write(|w| {
+            for i in 0..MAX_SEQUENCE_LEN {
+                w.set_memresifg(i, true);
+            }
+        });
+        r.dma_trig(0).imask().write(|w| {
+            for i in 0..MAX_SEQUENCE_LEN {
+                w.set_memresifg(i, true);
+            }
+        });
+
+        // Each conversion result lands in a consecutive MEMRESx register and triggers one DMA
+        // transfer into `readings`.
+        let transfer = unsafe {
+            dma.read_hw_trigger(
+                T::info().dma_trigger,
+                r.memres(0).as_ptr().cast::<u16>(),
+                readings,
+                TransferOptions {
+                    mode: TransferMode::Single,
+                    ..Default::default()
+                },
+            )?
+        };
+
+        r.ctl0().modify(|w| {
+            w.set_enc(true);
+        });
+
+        r.ctl1().modify(|w| {
+            w.set_sc(vals::Sc::START);
+        });
+
+        transfer.await;
+
+        Ok(())
+    }
 }
 
 /// Peripheral instance trait.
@@ -368,7 +461,7 @@ pub trait Instance: PeripheralType + SealedInstance + 'static {
 /// The borrowed channel cannot consume the channel source because it might need to run drop code.
 pub struct BorrowedAdcChannel<'a, T> {
     pub(crate) channel: u8,
-    pub(crate) _marker: PhantomData<&'a mut T>,
+    pub(crate) _marker: PhantomData<&'a T>,
 }
 
 impl<T> BorrowedAdcChannel<'_, T> {
@@ -407,6 +500,14 @@ impl<'a, T> SealedBorrowedChannel<'a, T> for BorrowedAdcChannel<'a, T> {
 pub trait AdcChannel<T>: SealedAdcChannel<T> + Sized {
     #[allow(unused_mut)]
     fn reborrow_adc<'a>(&'a mut self) -> BorrowedAdcChannel<'a, T> {
+        self.borrow_adc()
+    }
+
+    /// Borrow the channel as a type-erased ADC channel.
+    ///
+    /// Unlike [`Self::reborrow_adc`], this only requires a shared reference, so the same channel
+    /// can be used multiple times, e.g. to sample a channel repeatedly in a sequence.
+    fn borrow_adc(&self) -> BorrowedAdcChannel<'_, T> {
         self.setup();
 
         BorrowedAdcChannel {
@@ -556,6 +657,10 @@ impl State {
 pub(crate) struct Info {
     pub(crate) regs: Regs,
     pub(crate) interrupt: Interrupt,
+    /// DMA trigger source (DMATCTL.DMATSEL) that triggers a DMA transfer on a conversion result.
+    ///
+    /// Only meaningful when the `adc_dma` cfg is enabled.
+    pub(crate) dma_trigger: u8,
 }
 
 /// Peripheral instance trait.
@@ -600,7 +705,7 @@ const fn convert_stime(stime: SampleTimeComparator) -> vals::Stime {
 }
 
 macro_rules! impl_adc_instance {
-    ($instance: ident) => {
+    ($instance: ident, $dma_trigger: expr) => {
         impl crate::adc::SealedInstance for crate::peripherals::$instance {
             fn info() -> &'static crate::adc::Info {
                 use crate::adc::Info;
@@ -609,6 +714,7 @@ macro_rules! impl_adc_instance {
                 static INFO: Info = Info {
                     regs: crate::pac::$instance,
                     interrupt: crate::interrupt::typelevel::$instance::IRQ,
+                    dma_trigger: $dma_trigger,
                 };
                 &INFO
             }

@@ -54,19 +54,24 @@ fn generate_code(cfgs: &mut CfgSet) {
         cfgs.declare_all(&get_chip_cfgs(&chip));
     }
 
+    let adc_dma_triggers = adc_dma_triggers(&chip_name);
+    cfgs.declare("adc_dma");
+    if adc_dma_triggers.is_some() {
+        cfgs.enable("adc_dma");
+    }
+
     let mut singletons = get_singletons(cfgs);
 
     time_driver(&mut singletons, cfgs);
     pin_features(&mut singletons);
 
     let mut g = TokenStream::new();
-
     g.extend(generate_singletons(&singletons));
     g.extend(generate_pincm_mapping());
     g.extend(generate_pin());
     g.extend(generate_timers());
     g.extend(generate_interrupts());
-    g.extend(generate_peripheral_instances());
+    g.extend(generate_peripheral_instances(adc_dma_triggers));
     g.extend(generate_pin_trait_impls());
     g.extend(generate_groups());
     g.extend(generate_dma_channel_count());
@@ -146,6 +151,34 @@ fn get_chip_cfgs(chip_name: &str) -> Vec<String> {
     }
 
     cfgs
+}
+
+/// ADC DMA trigger source (DMATCTL.DMATSEL) per ADC instance, from each family datasheet's
+/// "DMA Trigger Mapping" table. Chips without an entry have ADC DMA support disabled.
+fn adc_dma_triggers(chip_name: &str) -> Option<&'static [(&'static str, u8)]> {
+    let triggers: &'static [(&'static str, u8)] = match () {
+        // SLASEC0
+        _ if chip_name.starts_with("mspm0c110") => &[("ADC0", 15)],
+        // SLASF11
+        _ if chip_name.starts_with("mspm0g110") => &[("ADC0", 23), ("ADC1", 24)],
+        // SLASF10
+        _ if chip_name.starts_with("mspm0g150") => &[("ADC0", 23), ("ADC1", 24)],
+        _ if chip_name.starts_with("mspm0g151") => &[("ADC0", 32), ("ADC1", 33)],
+        // SLASF12
+        _ if chip_name.starts_with("mspm0g310") => &[("ADC0", 23), ("ADC1", 24)],
+        _ if chip_name.starts_with("mspm0g350") => &[("ADC0", 23), ("ADC1", 24)],
+        _ if chip_name.starts_with("mspm0g351") => &[("ADC0", 32), ("ADC1", 33)],
+        _ if chip_name.starts_with("mspm0g511") || chip_name.starts_with("mspm0g518") => &[("ADC0", 23)],
+        // SLASFB9
+        _ if chip_name.starts_with("mspm0h321") => &[("ADC0", 15)],
+        _ if chip_name.starts_with("mspm0l110") => &[("ADC0", 3)],
+        _ if chip_name.starts_with("mspm0l122") || chip_name.starts_with("mspm0l222") => &[("ADC0", 25)],
+        // SLASEX0
+        _ if chip_name.starts_with("mspm0l130") || chip_name.starts_with("mspm0l134") => &[("ADC0", 3)],
+        _ => return None,
+    };
+
+    Some(triggers)
 }
 
 /// Interrupt groups use a weakly linked symbols and #[linkage = "extern_weak"] is nightly we need to
@@ -672,7 +705,7 @@ fn generate_interrupts() -> TokenStream {
     }
 }
 
-fn generate_peripheral_instances() -> TokenStream {
+fn generate_peripheral_instances(adc_dma_triggers: Option<&[(&str, u8)]>) -> TokenStream {
     let mut impls = Vec::<TokenStream>::new();
 
     for peripheral in METADATA.peripherals {
@@ -683,7 +716,19 @@ fn generate_peripheral_instances() -> TokenStream {
             "uart" => Some(quote! { impl_uart_instance!(#peri); }),
             "i2c" => Some(quote! { impl_i2c_instance!(#peri, #fifo_size); }),
             "wwdt" => Some(quote! { impl_wwdt_instance!(#peri); }),
-            "adc" => Some(quote! { impl_adc_instance!(#peri); }),
+            "adc" => {
+                let dma_trigger = adc_dma_triggers
+                    .and_then(|triggers| {
+                        triggers
+                            .iter()
+                            .find(|(name, _)| *name == peripheral.name)
+                            .map(|(_, trigger)| trigger)
+                    })
+                    .copied()
+                    .unwrap_or(0);
+
+                Some(quote! { impl_adc_instance!(#peri, #dma_trigger); })
+            }
             "mathacl" => Some(quote! { impl_mathacl_instance!(#peri); }),
             "flashctl" => Some(quote! { impl_flash_instance!(#peri); }),
             _ => None,

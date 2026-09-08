@@ -15,7 +15,7 @@ use embassy_hal_internal::interrupt::InterruptExt;
 use embassy_sync::waitqueue::AtomicWaker;
 use mspm0_metapac::common::{RW, Reg};
 use mspm0_metapac::dma::regs;
-use mspm0_metapac::dma::vals::{self, Autoen, Em, Incr, Preirq, Wdth};
+use mspm0_metapac::dma::vals::{self, Autoen, Em, Preirq, Wdth};
 
 use crate::interrupt::typelevel::{Handler, Interrupt};
 use crate::{Peri, interrupt, pac};
@@ -107,8 +107,8 @@ impl<'d> Channel<'d> {
             dst.cast(),
             DW::width(),
             dst.len() as u16,
-            false,
-            true,
+            vals::Incr::UNCHANGED,
+            vals::Incr::INCREMENT,
             options,
         );
         transfer.channel.start();
@@ -147,11 +147,51 @@ impl<'d> Channel<'d> {
             dst.cast(),
             DW::width(),
             src.len() as u16,
-            true,
-            false,
+            vals::Incr::INCREMENT,
+            vals::Incr::UNCHANGED,
             options,
         );
         transfer.channel.start();
+
+        Ok(transfer)
+    }
+
+    /// Create a new read DMA transfer from an array of peripheral registers driven by hardware
+    /// triggers.
+    ///
+    /// The source address advances by 2 register widths after each transfer, matching the
+    /// register spacing of the ADC `MEMRES` registers. No software request is issued: the channel
+    /// is armed and the transfer waits for triggers from `trigger_source`.
+    ///
+    /// # Safety
+    ///
+    /// - `src` must be valid for the lifetime of the transfer.
+    /// - `dst` must be valid for the lifetime of the transfer.
+    pub unsafe fn read_hw_trigger<'a, SW: Word, DW: Word>(
+        &'a mut self,
+        trigger_source: u8,
+        src: *mut SW,
+        dst: &'a mut [DW],
+        options: TransferOptions,
+    ) -> Result<Transfer<'a>, Error> {
+        verify_transfer::<DW>(dst)?;
+
+        let transfer = Transfer {
+            channel: self.reborrow(),
+        };
+        transfer.channel.configure(
+            trigger_source,
+            src.cast(),
+            SW::width(),
+            dst.as_mut_ptr().cast(),
+            DW::width(),
+            dst.len() as u16,
+            vals::Incr::STRIDE_2,
+            vals::Incr::INCREMENT,
+            options,
+        );
+        // A software request would perform one spurious transfer before the first conversion.
+        transfer.channel.arm();
 
         Ok(transfer)
     }
@@ -500,8 +540,8 @@ impl<'d> Channel<'d> {
         dst: *const u32,
         dst_wdth: Wdth,
         transfer_count: u16,
-        increment_src: bool,
-        increment_dst: bool,
+        increment_src: vals::Incr,
+        increment_dst: vals::Incr,
         options: TransferOptions,
     ) {
         // "Subsequent reads and writes cannot be moved ahead of preceding reads."
@@ -521,16 +561,8 @@ impl<'d> Channel<'d> {
             w.set_preirq(Preirq::PREIRQ_DISABLE);
             w.set_srcwdth(src_wdth);
             w.set_dstwdth(dst_wdth);
-            w.set_srcincr(if increment_src {
-                Incr::INCREMENT
-            } else {
-                Incr::UNCHANGED
-            });
-            w.set_dstincr(if increment_dst {
-                Incr::INCREMENT
-            } else {
-                Incr::UNCHANGED
-            });
+            w.set_srcincr(increment_src);
+            w.set_dstincr(increment_dst);
 
             w.set_em(Em::NORMAL);
             // Single and block will clear the enable bit when the transfers finish.
@@ -570,6 +602,14 @@ impl<'d> Channel<'d> {
         });
     }
 
+    /// Arm the channel to wait for hardware triggers, without issuing a software request.
+    fn arm(&self) {
+        self.mask_interrupt(true);
+
+        // "Subsequent reads and writes cannot be moved ahead of preceding reads."
+        compiler_fence(Ordering::SeqCst);
+    }
+
     fn resume(&self) {
         self.mask_interrupt(true);
 
@@ -586,12 +626,9 @@ impl<'d> Channel<'d> {
         // "Subsequent reads and writes cannot be moved ahead of preceding reads."
         compiler_fence(Ordering::SeqCst);
 
-        // Stop the transfer.
-        //
-        // SLAU846 5.2.6:
-        // "A DMA block transfer in progress can be stopped by clearing the DMAEN bit"
+        // SLAU846 5.2.6: "A DMA block transfer in progress can be stopped by clearing the DMAEN bit"
         self.ctl().modify(|w| {
-            // w.set_en(false);
+            w.set_en(false);
             w.set_req(false);
         });
     }
@@ -600,12 +637,9 @@ impl<'d> Channel<'d> {
         // "Subsequent reads and writes cannot be moved ahead of preceding reads."
         compiler_fence(Ordering::SeqCst);
 
-        let ctl = self.ctl().read();
-
-        // Is the transfer requested?
-        ctl.req()
-            // Is the channel enabled?
-            && ctl.en()
+        // The channel is enabled. DMAEN is automatically cleared by hardware once all transfers
+        // have been made (single and block transfer modes), so this doubles as a "done" check.
+        self.ctl().read().en()
     }
 }
 
